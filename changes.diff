@@ -1,0 +1,210 @@
+--- original/main.lua
++++ reviewed/main.lua
+@@ -1,4 +1,6 @@
+ -- CutsceneFix for Phantom Blade Zero (UE4SS Lua mod)
++-- Local reviewed revision: exact URL matching, transactional source edits,
++-- deferred success cache, and bounded handling of incomplete codec metadata.
+ --
+ -- Some pre-rendered cutscenes in Content/Movies are 4K60 H.264 at level 5.2, which is above
+ -- what the Windows H.264 decoder officially supports (level 5.1). On affected PCs they stay
+@@ -92,12 +94,14 @@
+ local function codecTooHigh(mp)
+     local codec = str(call(mp, "GetVideoTrackType", 0, 0))
+     if codec == "" then return nil, codec end      -- not known yet
+-    if not (codec:find("AVC") or codec:find("264")) then return false, codec end
++    if not (codec:lower():find("avc", 1, true) or codec:find("264", 1, true)) then return false, codec end
+     local level = tonumber(codec:match("[Ll]evel%s*([%d%.]+)"))
+-    return level ~= nil and level > MAX_H264_LEVEL, codec
++    if level == nil then return nil, codec end -- incomplete metadata: retry within watch window
++    return level > MAX_H264_LEVEL, codec
+ end
+ 
+ local function shortName(url) return url:match("([^/\\]+)$") or url end
++local function normalizedUrl(url) return url:gsub("\\", "/") end
+ 
+ ---------------------------------------------------------------------------
+ -- Media sources: find the object the game opens from, and point it at MoviesHalfRes
+@@ -160,11 +164,12 @@
+ end
+ 
+ -- Returns (source, newUrl) on success, or nil
+-function redirectSources(playerUrl)
+-    local file = shortName(playerUrl)
++local function redirectSources(playerUrl)
++    if playerUrl == "" then return nil end
++    local targetUrl = normalizedUrl(playerUrl)
+     local matches = {}
+     for _, src in ipairs(allSources()) do
+-        if str(call(src, "GetUrl")):find(file, 1, true) then table.insert(matches, src) end
++        if normalizedUrl(str(call(src, "GetUrl"))) == targetUrl then table.insert(matches, src) end
+     end
+ 
+     if #matches == 0 then
+@@ -178,21 +183,33 @@
+ 
+     for _, src in ipairs(matches) do
+         local before = str(call(src, "GetUrl"))
++        local edits = {}
++        local function rollback()
++            for _, edit in ipairs(edits) do
++                local ok, err = pcall(function()
++                    -- Do not overwrite a subsequent change made by the game.
++                    if str(src[edit.name]) == edit.after then src[edit.name] = edit.before end
++                end)
++                if not ok then log("Source rollback failed: " .. tostring(err)) end
++            end
++        end
+         forEachProp(src, function(name, ptype)
+             if ptype ~= "StrProperty" then return end
+             local ok, v = pcall(function() return str(src[name]) end)
+-            if not ok then return end
++            if not ok or normalizedUrl(v) ~= normalizedUrl(before) then return end
+             local newV, changed = toHalfRes(v)
+             if changed then
+                 local okSet, err = pcall(function() src[name] = newV end)
++                if okSet then table.insert(edits, {name=name, before=v, after=newV}) end
+                 log(string.format("  %s.%s: %s -> %s %s", str(call(src, "GetFName")), name, v, newV,
+                     okSet and "" or ("(FAILED: " .. tostring(err) .. ")")))
+             end
+         end)
+         local after = str(call(src, "GetUrl"))
+         if after ~= before and after:find("MoviesHalfRes", 1, true) then
+-            return src, after
+-        end
++            return src, after, rollback
++        end
++        rollback()
+         log("Rewrite didn't change the source's URL. Its properties:")
+         describe(src)
+     end
+@@ -201,37 +218,48 @@
+ 
+ local function checkPlayer(addr, mp)
+     local url = str(call(mp, "GetUrl"))
+-    if url == "" then states[addr] = nil return end
+-
+     local st = states[addr]
++    if url == "" then
++        if st and st.pending and st.rollback then st.rollback() end
++        states[addr] = nil
++        return
++    end
+     if st == nil or (url ~= st.url and url ~= st.halfUrl) then
++        if st and st.pending and st.rollback then st.rollback() end
+         st = { url = url, first = tick, swaps = 0 }
+         states[addr] = st
++    end
++
++    if st.pending and secondsSince(st.swappedAt) > GIVE_UP_SECONDS then
++        log("Half-res playback timed out: " .. shortName(url))
++        if st.rollback then st.rollback() end
++        st.pending, st.gaveUp = false, true
++        return
+     end
+ 
+     -- Our half-res copy is loading / playing
+     if st.halfUrl ~= nil and url == st.halfUrl then
+         if st.pending then
+             if call(mp, "IsReady") then
+-                if not call(mp, "IsPlaying") then call(mp, "Play") end
++                if not call(mp, "IsPlaying") and call(mp, "Play") ~= true then return end
+                 if RESYNC then
+                     local target = math.floor(secondsSince(st.first) * 10000000)
+-                    local ok = pcall(function() mp:Seek({ Ticks = target }) end)
+-                    if not ok then log("Resync seek failed (harmless; video may lag the audio slightly)") end
++                    local ok, sought = pcall(function() return mp:Seek({ Ticks = target }) end)
++                    if not ok or sought ~= true then log("Resync seek failed; video may lag the audio") end
+                 end
+                 st.pending, st.checked = false, true
++                rememberBad(shortName(st.url))
++                st.rollback = nil
+                 log("Half-res copy playing: " .. shortName(url))
+-            elseif secondsSince(st.swappedAt) > GIVE_UP_SECONDS then
+-                log("Half-res copy still not ready after " .. GIVE_UP_SECONDS .. "s: " .. shortName(url))
+-                st.pending, st.gaveUp = false, true
+             end
+         end
+         return
+     end
+ 
+     -- Original file
++    if st.pending then return end -- OpenSource may accept before GetUrl changes
+     if st.checked or st.gaveUp then return end
+-    if not url:find("/Content/Movies/", 1, true) then st.checked = true return end
++    if not normalizedUrl(url):find("/Content/Movies/", 1, true) then st.checked = true return end
+ 
+     local tooHigh, codec
+     if knownBad[shortName(url)] then
+@@ -254,7 +282,7 @@
+     log(string.format("%s is %s - redirecting its media source to the half-res copy", shortName(url), codec))
+     st.swaps = st.swaps + 1
+ 
+-    local src, newUrl = redirectSources(url)
++    local src, newUrl, rollback = redirectSources(url)
+     if src == nil then
+         log("Couldn't redirect the source; leaving this video alone (details above).")
+         st.gaveUp = true
+@@ -262,9 +290,13 @@
+     end
+ 
+     st.halfUrl, st.pending, st.swappedAt = newUrl, true, tick
+-    rememberBad(shortName(url))
++    st.rollback = rollback
+     -- Reopen from the (now redirected) source, so the game's own check sees a match
+-    call(mp, "OpenSource", src)
++    if call(mp, "OpenSource", src) ~= true then
++        rollback()
++        st.pending, st.gaveUp = false, true
++        log("OpenSource rejected the half-res copy; source restored: " .. shortName(url))
++    end
+ end
+ 
+ ---------------------------------------------------------------------------
+@@ -283,6 +315,8 @@
+         local mp = players[addr]
+         local okv, valid = pcall(function() return mp:IsValid() end)
+         if not (okv and valid) then
++            local st = states[addr]
++            if st and st.pending and st.rollback then st.rollback() end
+             players[addr], states[addr] = nil, nil
+             stopWatching(addr)
+         else
+@@ -291,7 +325,16 @@
+             local st = states[addr]
+             local pending = st ~= nil and st.pending
+             local done = st ~= nil and (st.checked or st.gaveUp) and not pending
+-            if done or (tick >= untilTick and not pending) then stopWatching(addr) end
++            if done then
++                stopWatching(addr)
++            elseif tick >= untilTick and not pending then
++                local url = str(call(mp, "GetUrl"))
++                if url ~= "" then
++                    log("Watch expired without a decision: " .. url .. " ready=" ..
++                        tostring(call(mp, "IsReady")) .. " codec=" .. str(call(mp, "GetVideoTrackType", 0, 0)))
++                end
++                stopWatching(addr)
++            end
+         end
+     end
+ end
+@@ -368,9 +411,10 @@
+ end
+ 
+ local function playerFromUrl(url)
+-    local file = shortName(url)
++    if url == "" then return nil end
++    local targetUrl = normalizedUrl(url)
+     for _, mp in pairs(players) do
+-        if str(call(mp, "GetUrl")):find(file, 1, true) then return mp end
++        if normalizedUrl(str(call(mp, "GetUrl"))) == targetUrl then return mp end
+     end
+     return nil
+ end
+@@ -419,5 +463,5 @@
+ 
+ local n = 0
+ for _ in pairs(knownBad) do n = n + 1 end
+-log(string.format("Loaded. Redirecting H.264 videos above level %s to MoviesHalfRes (%d known bad file%s, %d hook%s).",
++log(string.format("Loaded reviewed revision 1. Redirecting H.264 videos above level %s to MoviesHalfRes (%d known bad file%s, %d hook%s).",
+     MAX_H264_LEVEL, n, n == 1 and "" or "s", hooked, hooked == 1 and "" or "s"))
+
