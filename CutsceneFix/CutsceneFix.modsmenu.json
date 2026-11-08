@@ -1,0 +1,34 @@
+{
+  "title": "Cutscene Fix",
+  "description": "Fixes pre-rendered cutscenes that stay black while the audio plays. Every story cutscene is a 4K video above the Windows H.264 decoder's limit; this switches each to the game's own 1080p copy, in sync with the voices. Every other video is left alone.",
+  "version": "1.4.2",
+  "settings": [
+    {
+      "key": "Enabled",
+      "type": "toggle",
+      "label": "Enabled",
+      "default": true,
+      "help": "Off: every video plays as the game picks it."
+    },
+    {
+      "key": "Resync",
+      "type": "toggle",
+      "label": "Keep picture in sync",
+      "default": true,
+      "help": "Moves the 1080p copy to where the original would be, so the picture matches the voices. Turn off if the picture jumps at the start of a cutscene."
+    },
+    {
+      "key": "DetailedLog",
+      "type": "toggle",
+      "label": "Detailed log",
+      "default": false,
+      "help": "Writes every video checked, not just switched ones, to the UE4SS log."
+    },
+    {
+      "key": "ForgetVideos",
+      "type": "action",
+      "label": "Forget remembered videos",
+      "help": "Videos a game update adds and the mod finds too high are remembered in known_bad.txt and switched at once next time. This empties that list. The game's own cutscenes are built in and always switched."
+    }
+  ]
+}

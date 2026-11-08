@@ -1,6 +1,4 @@
 -- CutsceneFix for Phantom Blade Zero (UE4SS Lua mod)
--- Local reviewed revision: exact URL matching, transactional source edits,
--- deferred success cache, and bounded handling of incomplete codec metadata.
 --
 -- Some pre-rendered cutscenes in Content/Movies are 4K60 H.264 at level 5.2, which is above
 -- what the Windows H.264 decoder officially supports (level 5.1). On affected PCs they stay
@@ -10,6 +8,11 @@
 -- This mod checks videos as they open. Only when a video exceeds MAX_H264_LEVEL does it
 -- redirect it to the same file in MoviesHalfRes. Everything else is left alone.
 --
+-- 1.4.1: every story cutscene in the game (66, read from its Movie paks) is level 5.2 with a level 4.2 copy, so
+-- they are switched by name as soon as the mod sees them, without waiting for the decoder to report a level (a
+-- decoder that refuses the video, or Proton, which names no level, never does). The level check stays for videos a
+-- game update may add. A video that fails to open is switched from the address the failure reports.
+--
 -- Event-driven: nothing runs until a video finishes opening
 -- (PBZMediaImageAspectBinder:HandleMediaOpened) or a new media player is created. Then just that player is
 -- watched for up to WATCH_SECONDS, and the watcher stops as soon as it has been checked.
@@ -18,15 +21,34 @@
 ---------------------------------------------------------------------------
 -- Settings
 ---------------------------------------------------------------------------
+-- Enabled, Resync and DetailedLog are set in CutsceneFix.config.json (and the PBZ Mods Menu); these are the defaults.
+local ENABLED         = true
 local MAX_H264_LEVEL  = 5.1    -- swap anything above this
+local RESYNC          = true   -- seek the half-res copy to where the original "should" be
+local VERBOSE         = false  -- log triggers and every video checked, not just swaps
 local POLL_MS         = 50     -- check interval, only while a video is being watched
 local WATCH_SECONDS   = 6      -- how long to watch a player after a trigger
-local RESYNC          = true   -- seek the half-res copy to where the original "should" be
 local GIVE_UP_SECONDS = 3      -- if the half-res copy isn't ready by then, stop trying
-local VERBOSE         = false  -- log triggers and every video checked, not just swaps
 
 ---------------------------------------------------------------------------
 local function log(msg) print("[CutsceneFix] " .. tostring(msg) .. "\n") end
+
+local MOD_DIR = (function()
+    local src = (debug.getinfo(1, "S").source or ""):gsub("^@", "")
+    return src:match("^(.*)[/\\][Ss]cripts[/\\][^/\\]+$")
+end)()
+local MC = dofile(MOD_DIR .. "/scripts/pbz_menuconfig.lua")
+local cfg = MC.config("CutsceneFix", MOD_DIR,
+    { Enabled = true, Resync = true, DetailedLog = false },
+    { "Enabled", "Resync", "DetailedLog" }, nil, log)
+
+local function applyConfig()
+    local v = cfg:load()
+    ENABLED = v.Enabled ~= false
+    RESYNC = v.Resync ~= false
+    VERBOSE = v.DetailedLog == true
+end
+applyConfig()
 
 local function str(v)
     if v == nil then return "" end
@@ -42,22 +64,18 @@ local function call(obj, method, ...)
     return nil
 end
 
-local players  = {}   -- address -> MediaPlayer (every player we've seen)
+-- No game object is kept between frames: a destroyed player's memory can be reused or released, and touching it
+-- then crashes UE4SS outright (1.3.0 and 1.4.1 kept every player they had seen; a crash at the Loong Pillar).
+-- Each poll looks the players up afresh; only their addresses, as plain numbers, key the per-video state.
 local states   = {}   -- address -> per-video state
-local watching = {}   -- address -> tick at which to stop watching
-local watchCount = 0
+local watchUntil = 0  -- tick at which the watcher stops (unless a switch is still pending)
+local failedUrl       -- a video the game reported as failed to open, to be switched on the next poll
 local tick     = 0    -- watch-loop counter, used as a clock
 local busy, loopRunning = false, false
 
 local function addrOf(obj)
     local ok, addr = pcall(function() return obj:GetAddress() end)
     return ok and addr or nil
-end
-
-local function track(mp)
-    local addr = addrOf(mp)
-    if addr then players[addr] = mp end
-    return addr
 end
 
 local function secondsSince(t) return (tick - t) * POLL_MS / 1000 end
@@ -67,11 +85,83 @@ local function ticksFor(seconds) return math.ceil(seconds * 1000 / POLL_MS) end
 -- Remembered bad files (known_bad.txt in the mod folder)
 ---------------------------------------------------------------------------
 local knownBad = {}
-local KNOWN_BAD_PATH = (function()
-    local src = (debug.getinfo(1, "S").source or ""):gsub("^@", "")
-    local dir = src:match("^(.*)[/\\][Ss]cripts[/\\][^/\\]+$")
-    return dir and (dir .. "/known_bad.txt") or nil
-end)()
+-- Every story cutscene in the game: 4K H.264 at level 5.2, each with a level 4.2 copy in MoviesHalfRes (read from the
+-- game's Movie paks, build of November 2026: 66 of the 400 videos). These switch as soon as the mod sees them, without
+-- waiting for the decoder to report a level: a decoder that refuses the video, or (Proton) names no level, never would.
+local BUILTIN_BAD = {
+    "2D_DuanHun_g04_ShiFu_1080p_30FPS.mp4",
+    "2D_LuJiaCun_g02_jichengren_1080p.mp4",
+    "2D_PangZhen_g03_shaonian_1080p.mp4",
+    "2Dmix+CGguishou.mp4",
+    "3DCG_C02_JieMeng.mp4",
+    "3DCG_C03_XianZheYunLuo.mp4",
+    "3DCG_C04_MoBao-variant1.mp4",
+    "3DCG_C05_MoBao-variant2.mp4",
+    "3DCG_C06_MoBao-variant3.mp4",
+    "3DCG_C07_MoBao.mp4",
+    "3DCG_C08_MoBao-variant4.mp4",
+    "Chapter01_2026.7.20.mp4",
+    "Chapter02_2026.7.20.mp4",
+    "Chapter03_2026.7.20.mp4",
+    "Chapter04_2026.7.20.mp4",
+    "Chapter05_2026.7.20.mp4",
+    "Chapter06_2026.7.20.mp4",
+    "Chapter07_2026.7.20.mp4",
+    "Chapter08_2026.7.20.mp4",
+    "DEMO_CN_logo.mp4",
+    "DEMO_EN_logo.mp4",
+    "EasyDifficulty.mp4",
+    "Ending_Juezhan_Alpha.mp4",
+    "Ending_Juezhan_Alpha_EN.mp4",
+    "Ending_Juezhan_RGB.mp4",
+    "Ending_Juezhan_RGB_EN.mp4",
+    "Ending_Longyin_Alpha.mp4",
+    "Ending_Longyin_Alpha_EN.mp4",
+    "Ending_Longyin_RGB.mp4",
+    "Ending_Longyin_RGB_EN.mp4",
+    "Ending_Yanmie_Alpha.mp4",
+    "Ending_Yanmie_Alpha_EN.mp4",
+    "Ending_Yanmie_RGB.mp4",
+    "Ending_Yanmie_RGB_EN.mp4",
+    "Ending_Yinhen_Alpha.mp4",
+    "Ending_Yinhen_Alpha_EN.mp4",
+    "Ending_Yinhen_RGB.mp4",
+    "Ending_Yinhen_RGB_EN.mp4",
+    "HardDifficulty.mp4",
+    "NightMareDifficulty.mp4",
+    "NormalDifficulty.mp4",
+    "PBZlogo-EN_Alpha.mp4",
+    "PBZlogo-EN_RGB.mp4",
+    "PBZlogo_Alpha.mp4",
+    "PBZlogo_RGB.mp4",
+    "PlaceHolder1.mp4",
+    "PlaceHolder2.mp4",
+    "PlaceHolder3.mp4",
+    "Seq004_Render_1080p.mp4",
+    "Seq018-mask_Render_1080p.mp4",
+    "Seq018_cam11render.mp4",
+    "Seq148_render.mp4",
+    "Seq152_recap.mp4",
+    "Seqmashup_bossrecap.mp4",
+    "Seqs001_Render.mp4",
+    "Seqs002_Render.mp4",
+    "Seqs013_cam8render.mp4",
+    "Seqs019-flash_render_H265.mp4",
+    "Seqs020_render.mp4",
+    "Seqs021flash001_render.mp4",
+    "Seqs024_mashup.mp4",
+    "StartScreen_16x9.mp4",
+    "s017_rendercut_H265.mp4",
+    "seq051_012cut.mp4",
+    "seqs007_cam1-3Render_1080p.mp4",
+    "seqs013_cam1-3render.mp4",
+}
+local builtinBad = {}
+for _, n in ipairs(BUILTIN_BAD) do builtinBad[n:lower()] = true end
+local function isKnownBad(name)
+    return knownBad[name] or builtinBad[name:lower()] == true
+end
+local KNOWN_BAD_PATH = MOD_DIR and (MOD_DIR .. "/known_bad.txt") or nil
 
 local function loadKnownBad()
     if not KNOWN_BAD_PATH then return end
@@ -85,7 +175,7 @@ local function loadKnownBad()
 end
 
 local function rememberBad(name)
-    if knownBad[name] or not KNOWN_BAD_PATH then return end
+    if knownBad[name] or builtinBad[name:lower()] or not KNOWN_BAD_PATH then return end
     knownBad[name] = true
     local ok, f = pcall(io.open, KNOWN_BAD_PATH, "a")
     if ok and f then f:write(name .. "\n") f:close() end
@@ -94,14 +184,19 @@ end
 local function codecTooHigh(mp)
     local codec = str(call(mp, "GetVideoTrackType", 0, 0))
     if codec == "" then return nil, codec end      -- not known yet
-    if not (codec:lower():find("avc", 1, true) or codec:find("264", 1, true)) then return false, codec end
+    if not (codec:find("AVC") or codec:find("264")) then return false, codec end
     local level = tonumber(codec:match("[Ll]evel%s*([%d%.]+)"))
-    if level == nil then return nil, codec end -- incomplete metadata: retry within watch window
-    return level > MAX_H264_LEVEL, codec
+    return level ~= nil and level > MAX_H264_LEVEL, codec
 end
 
 local function shortName(url) return url:match("([^/\\]+)$") or url end
-local function normalizedUrl(url) return url:gsub("\\", "/") end
+
+local function videoHeight(mp)
+    local d = call(mp, "GetVideoTrackDimensions", 0, 0)
+    if d == nil then return nil end
+    local ok, y = pcall(function() return d.Y end)
+    return ok and tonumber(y) or nil
+end
 
 ---------------------------------------------------------------------------
 -- Media sources: find the object the game opens from, and point it at MoviesHalfRes
@@ -164,12 +259,11 @@ local function toHalfRes(s)
 end
 
 -- Returns (source, newUrl) on success, or nil
-local function redirectSources(playerUrl)
-    if playerUrl == "" then return nil end
-    local targetUrl = normalizedUrl(playerUrl)
+function redirectSources(playerUrl)
+    local file = shortName(playerUrl)
     local matches = {}
     for _, src in ipairs(allSources()) do
-        if normalizedUrl(str(call(src, "GetUrl"))) == targetUrl then table.insert(matches, src) end
+        if str(call(src, "GetUrl")):find(file, 1, true) then table.insert(matches, src) end
     end
 
     if #matches == 0 then
@@ -183,106 +277,98 @@ local function redirectSources(playerUrl)
 
     for _, src in ipairs(matches) do
         local before = str(call(src, "GetUrl"))
-        local edits = {}
-        local function rollback()
-            for _, edit in ipairs(edits) do
-                local ok, err = pcall(function()
-                    -- Do not overwrite a subsequent change made by the game.
-                    if str(src[edit.name]) == edit.after then src[edit.name] = edit.before end
-                end)
-                if not ok then log("Source rollback failed: " .. tostring(err)) end
-            end
-        end
         forEachProp(src, function(name, ptype)
             if ptype ~= "StrProperty" then return end
             local ok, v = pcall(function() return str(src[name]) end)
-            if not ok or normalizedUrl(v) ~= normalizedUrl(before) then return end
+            if not ok then return end
             local newV, changed = toHalfRes(v)
             if changed then
                 local okSet, err = pcall(function() src[name] = newV end)
-                if okSet then table.insert(edits, {name=name, before=v, after=newV}) end
                 log(string.format("  %s.%s: %s -> %s %s", str(call(src, "GetFName")), name, v, newV,
                     okSet and "" or ("(FAILED: " .. tostring(err) .. ")")))
             end
         end)
         local after = str(call(src, "GetUrl"))
         if after ~= before and after:find("MoviesHalfRes", 1, true) then
-            return src, after, rollback
+            return src, after
         end
-        rollback()
         log("Rewrite didn't change the source's URL. Its properties:")
         describe(src)
     end
     return nil
 end
 
-local function checkPlayer(addr, mp)
+function checkPlayer(addr, mp)
     local url = str(call(mp, "GetUrl"))
+    if url == "" then states[addr] = nil return end
+
     local st = states[addr]
-    if url == "" then
-        if st and st.pending and st.rollback then st.rollback() end
-        states[addr] = nil
-        return
-    end
     if st == nil or (url ~= st.url and url ~= st.halfUrl) then
-        if st and st.pending and st.rollback then st.rollback() end
         st = { url = url, first = tick, swaps = 0 }
         states[addr] = st
-    end
-
-    if st.pending and secondsSince(st.swappedAt) > GIVE_UP_SECONDS then
-        log("Half-res playback timed out: " .. shortName(url))
-        if st.rollback then st.rollback() end
-        st.pending, st.gaveUp = false, true
-        return
     end
 
     -- Our half-res copy is loading / playing
     if st.halfUrl ~= nil and url == st.halfUrl then
         if st.pending then
             if call(mp, "IsReady") then
-                if not call(mp, "IsPlaying") and call(mp, "Play") ~= true then return end
+                if not call(mp, "IsPlaying") then call(mp, "Play") end
                 if RESYNC then
                     local target = math.floor(secondsSince(st.first) * 10000000)
-                    local ok, sought = pcall(function() return mp:Seek({ Ticks = target }) end)
-                    if not ok or sought ~= true then log("Resync seek failed; video may lag the audio") end
+                    local ok = pcall(function() mp:Seek({ Ticks = target }) end)
+                    if not ok then log("Resync seek failed (harmless; video may lag the audio slightly)") end
                 end
                 st.pending, st.checked = false, true
-                rememberBad(shortName(st.url))
-                st.rollback = nil
                 log("Half-res copy playing: " .. shortName(url))
+            elseif secondsSince(st.swappedAt) > GIVE_UP_SECONDS then
+                log("Half-res copy still not ready after " .. GIVE_UP_SECONDS .. "s: " .. shortName(url))
+                st.pending, st.gaveUp = false, true
             end
         end
         return
     end
 
     -- Original file
-    if st.pending then return end -- OpenSource may accept before GetUrl changes
     if st.checked or st.gaveUp then return end
-    if not normalizedUrl(url):find("/Content/Movies/", 1, true) then st.checked = true return end
+    if not url:find("/Content/Movies/", 1, true) then st.checked = true return end
 
     local tooHigh, codec
-    if knownBad[shortName(url)] then
-        -- Seen before: redirect immediately, without waiting for the decoder to report
-        tooHigh, codec = true, "known bad"
+    if isKnownBad(shortName(url)) then
+        -- Seen before, or one of the game's level 5.2 cutscenes: redirect at once, without waiting for the decoder
+        tooHigh, codec = true, knownBad[shortName(url)] and "remembered" or "level 5.2 cutscene"
     else
-        if not call(mp, "IsReady") then return end
+        if not call(mp, "IsReady") then
+            -- never gets ready (the decoder refused it): switch after a while instead of leaving it black
+            if call(mp, "HasError") then
+                log(shortName(url) .. ": the player reports an error opening it - switching to the 1080p copy")
+                return switchToHalf(mp, url, st, "open error")
+            end
+            return
+        end
+        local height = videoHeight(mp)
         tooHigh, codec = codecTooHigh(mp)
-        if tooHigh == nil then return end
-        if VERBOSE then log(shortName(url) .. ": " .. codec) end
+        if tooHigh == nil then
+            if (st.codecWait or 0) < ticksFor(1) then st.codecWait = (st.codecWait or 0) + 1 return end
+            tooHigh, codec = false, "codec not reported"
+        end
+        codec = codec .. (height and (", " .. height .. "p") or "")
+        log(shortName(url) .. ": " .. codec)
+        if not tooHigh then st.checked = true return end
     end
+    return switchToHalf(mp, url, st, codec)
+end
 
-    if not tooHigh then st.checked = true return end
+function switchToHalf(mp, url, st, codec)
     if st.swaps >= 2 then
         log("Game keeps reopening the original; leaving it alone: " .. shortName(url))
         st.gaveUp = true
         return
     end
 
-    log(string.format("%s is %s - redirecting its media source to the half-res copy", shortName(url), codec))
+    log(string.format("%s (%s) - redirecting its media source to the half-res copy", shortName(url), codec))
     st.swaps = st.swaps + 1
 
-    local src, newUrl, rollback = redirectSources(url)
+    local src, newUrl = redirectSources(url)
     if src == nil then
         log("Couldn't redirect the source; leaving this video alone (details above).")
         st.gaveUp = true
@@ -290,179 +376,174 @@ local function checkPlayer(addr, mp)
     end
 
     st.halfUrl, st.pending, st.swappedAt = newUrl, true, tick
-    st.rollback = rollback
+    rememberBad(shortName(url))
     -- Reopen from the (now redirected) source, so the game's own check sees a match
-    if call(mp, "OpenSource", src) ~= true then
-        rollback()
-        st.pending, st.gaveUp = false, true
-        log("OpenSource rejected the half-res copy; source restored: " .. shortName(url))
-    end
+    call(mp, "OpenSource", src)
 end
 
 ---------------------------------------------------------------------------
 -- Watcher: runs only while something is being watched, then stops itself
 ---------------------------------------------------------------------------
-local function stopWatching(addr)
-    if watching[addr] then
-        watching[addr] = nil
-        watchCount = watchCount - 1
+local function livePlayers()
+    local ok, list = pcall(FindAllOf, "MediaPlayer")
+    local out = {}
+    if ok and list then
+        for _, mp in pairs(list) do
+            local addr = addrOf(mp)
+            if addr then out[addr] = mp end
+        end
     end
+    return out
+end
+
+-- a video the game failed to open: switch the player it was in (now without a URL, or still showing it)
+local function handleFailed(live)
+    local url = failedUrl
+    failedUrl = nil
+    log(shortName(url) .. ": failed to open - switching to the 1080p copy")
+    local src, newUrl = redirectSources(url)
+    if not src then return end
+    for addr, mp in pairs(live) do
+        local cur = str(call(mp, "GetUrl"))
+        if cur == "" or cur:find(shortName(url), 1, true) then
+            states[addr] = { url = url, first = tick, swaps = 1, halfUrl = newUrl, pending = true, swappedAt = tick }
+            rememberBad(shortName(url))
+            call(mp, "OpenSource", src)
+            return
+        end
+    end
+    log("  (no player found for it; the source is redirected, so the next try opens the 1080p copy)")
 end
 
 local function poll()
     tick = tick + 1
-    for addr, untilTick in pairs(watching) do
-        local mp = players[addr]
-        local okv, valid = pcall(function() return mp:IsValid() end)
-        if not (okv and valid) then
-            local st = states[addr]
-            if st and st.pending and st.rollback then st.rollback() end
-            players[addr], states[addr] = nil, nil
-            stopWatching(addr)
-        else
-            local ok, err = pcall(checkPlayer, addr, mp)
-            if not ok then log("Error: " .. tostring(err)) end
-            local st = states[addr]
-            local pending = st ~= nil and st.pending
-            local done = st ~= nil and (st.checked or st.gaveUp) and not pending
-            if done then
-                stopWatching(addr)
-            elseif tick >= untilTick and not pending then
-                local url = str(call(mp, "GetUrl"))
-                if url ~= "" then
-                    log("Watch expired without a decision: " .. url .. " ready=" ..
-                        tostring(call(mp, "IsReady")) .. " codec=" .. str(call(mp, "GetVideoTrackType", 0, 0)))
-                end
-                stopWatching(addr)
-            end
-        end
+    local live = livePlayers()
+    if failedUrl then handleFailed(live) end
+    local pending = false
+    for addr, mp in pairs(live) do
+        local ok, err = pcall(checkPlayer, addr, mp)
+        if not ok then log("Error: " .. tostring(err)) end
+        local st = states[addr]
+        if st and st.pending then pending = true end
     end
+    for addr in pairs(states) do
+        if live[addr] == nil then states[addr] = nil end -- that player is gone
+    end
+    return tick < watchUntil or pending
 end
 
 local function startLoop()
     if loopRunning then return end
     loopRunning = true
     LoopAsync(POLL_MS, function()
-        if watchCount <= 0 and not busy then
-            loopRunning = false
-            if VERBOSE then log("Watcher idle") end
-            return true -- stop looping
-        end
-        if not busy then
-            busy = true
-            ExecuteInGameThread(function()
-                local ok, err = pcall(poll)
-                if not ok then log("Poll error: " .. tostring(err)) end
-                busy = false
-            end)
-        end
+        if not loopRunning then return true end -- stop looping
+        if busy then return false end
+        busy = true
+        ExecuteInGameThread(function()
+            local ok, more = pcall(poll)
+            if not ok then log("Poll error: " .. tostring(more)) end
+            if not (ok and more) then
+                loopRunning = false
+                if VERBOSE then log("Watcher idle") end
+            end
+            busy = false
+        end)
         return false
     end)
 end
 
-local function watch(mp, why)
-    local addr = track(mp)
-    if not addr then return end
-    if not watching[addr] then watchCount = watchCount + 1 end
-    watching[addr] = tick + ticksFor(WATCH_SECONDS)
-    local st = states[addr]
-    if st and not st.pending then states[addr] = nil end -- re-check from scratch
-    if VERBOSE then log("Watching player (" .. why .. ")") end
+-- Something happened to a video (a player was created, a video opened): check every player for a while.
+-- Videos already checked are checked again, as the game may reopen a player with a fresh source.
+local function trigger(why)
+    if not ENABLED then return end
+    for _, st in pairs(states) do
+        if not st.pending then st.checked, st.gaveUp = nil, nil end
+    end
+    watchUntil = tick + ticksFor(WATCH_SECONDS)
+    if VERBOSE then log("Checking videos (" .. why .. ")") end
     startLoop()
 end
 
-local function watchAllKnown(why)
-    for _, mp in pairs(players) do watch(mp, why) end
-end
-
 ---------------------------------------------------------------------------
--- Triggers
+-- Triggers: the hooks only note that something happened, and touch no game object
 ---------------------------------------------------------------------------
--- Pull a MediaPlayer out of a hooked function's parameters, if there is one
-local function playerFromParams(params)
-    for _, p in ipairs(params) do
-        local ok, v = pcall(function() return p:get() end)
-        if ok and type(v) == "userdata" then
-            local okC, cn = pcall(function() return v:GetClass():GetFName():ToString() end)
-            if okC and cn then
-                if cn:find("MediaPlayer") then return v end
-                if cn:find("MediaTexture") then
-                    local mp = call(v, "GetMediaPlayer")
-                    if mp ~= nil then return mp end
-                end
-            end
-        end
-    end
-    return nil
-end
-
--- The binder object usually holds a reference to the player it's attached to
-local function playerFromBinder(binder)
-    local found = nil
-    forEachProp(binder, function(name, ptype)
-        if found or ptype ~= "ObjectProperty" then return end
-        local ok, v = pcall(function() return binder[name] end)
-        if ok and type(v) == "userdata" then
-            local okC, cn = pcall(function() return v:GetClass():GetFName():ToString() end)
-            if okC and cn and cn:find("MediaPlayer") then found = v end
-        end
-    end)
-    return found
-end
-
-local function playerFromUrl(url)
-    if url == "" then return nil end
-    local targetUrl = normalizedUrl(url)
-    for _, mp in pairs(players) do
-        if normalizedUrl(str(call(mp, "GetUrl"))) == targetUrl then return mp end
-    end
-    return nil
-end
-
 -- Unreal's "media opened" event, as handled by the game's video binder. Event handlers are
 -- always invoked through reflection, so this fires even though the game opens videos from C++.
 local OPEN_HOOKS = {
     "/Script/ProjectPBZ.PBZMediaImageAspectBinder:HandleMediaOpened",
 }
 
+-- The binder's handlers, logged once at start; a "...Failed" one (not in the November 2026 build) is hooked too.
+-- (1.4.1 hooked them all, and HandleTracksChanged fires dozens of times per cutscene.)
+local function binderHandlers()
+    local names = {}
+    pcall(function()
+        local cls = StaticFindObject("/Script/ProjectPBZ.PBZMediaImageAspectBinder")
+        if cls == nil or not cls:IsValid() then return end
+        cls:ForEachFunction(function(f)
+            local ok, n = pcall(function() return f:GetFName():ToString() end)
+            if ok and n then table.insert(names, n) end
+        end)
+    end)
+    table.sort(names)
+    log("Video binder handlers: " .. (#names > 0 and table.concat(names, ", ") or "(none found)"))
+    for _, n in ipairs(names) do
+        if n:find("Fail") then table.insert(OPEN_HOOKS, "/Script/ProjectPBZ.PBZMediaImageAspectBinder:" .. n) end
+    end
+end
+
 local function registerHooks()
     local ok_count = 0
+    binderHandlers()
     for _, path in ipairs(OPEN_HOOKS) do
+        local why = path:match(":(.+)$") or "media opened"
         local ok = pcall(RegisterHook, path, function(ctx, ...)
-            local params = { ... }
-            local mp = playerFromParams(params)
-            if mp == nil then
-                local okB, binder = pcall(function() return ctx:get() end)
-                if okB and binder then mp = playerFromBinder(binder) end
-            end
-            if mp == nil and params[1] ~= nil then
+            if why:find("Fail") then
+                -- the URL is a string parameter, not a game object: safe to read here
+                local params = { ... }
                 local okU, url = pcall(function() return str(params[1]:get()) end)
-                if okU and url ~= "" then mp = playerFromUrl(url) end
+                if okU and url:find("/Movies/", 1, true) and not url:find("MoviesHalfRes", 1, true) then failedUrl = url end
             end
-            if mp then watch(mp, "media opened") else watchAllKnown("media opened") end
+            trigger(why)
         end)
         if ok then ok_count = ok_count + 1 end
     end
     return ok_count
 end
 
--- New players: track and watch them briefly
-NotifyOnNewObject("/Script/MediaAssets.MediaPlayer", function(mp) watch(mp, "new player") end)
-
--- Players that already exist: just remember them (no watching until a trigger)
-ExecuteInGameThread(function()
-    local list = FindAllOf("MediaPlayer")
-    if list then for _, mp in pairs(list) do track(mp) end end
-end)
+-- New players: check for a while (the player itself is not kept)
+NotifyOnNewObject("/Script/MediaAssets.MediaPlayer", function() trigger("new player") end)
 
 loadKnownBad()
+
+local function countKnownBad()
+    local n = 0
+    for _ in pairs(knownBad) do n = n + 1 end
+    return n
+end
+
+-- PBZ Mods Menu: settings saved, and the "forget remembered videos" action
+MC.onChanged("CutsceneFix", function()
+    applyConfig()
+    log(string.format("Settings changed: %s, resync %s, detailed log %s",
+        ENABLED and "on" or "OFF", RESYNC and "on" or "off", VERBOSE and "on" or "off"))
+end)
+MC.onAction("CutsceneFix", function(which)
+    if which == "ForgetVideos" then
+        local n = countKnownBad()
+        knownBad = {}
+        if KNOWN_BAD_PATH then
+            local f = io.open(KNOWN_BAD_PATH, "w")
+            if f then f:close() end
+        end
+        log("Forgot " .. n .. " remembered video(s); they are checked again the next time they play")
+    end
+end)
 local hooked = registerHooks()
 if hooked == 0 then
     log("WARNING: couldn't hook the game's media-opened handler; only newly created players will be checked.")
 end
 
-local n = 0
-for _ in pairs(knownBad) do n = n + 1 end
-log(string.format("Loaded reviewed revision 1. Redirecting H.264 videos above level %s to MoviesHalfRes (%d known bad file%s, %d hook%s).",
-    MAX_H264_LEVEL, n, n == 1 and "" or "s", hooked, hooked == 1 and "" or "s"))
-
+local n = countKnownBad()
+log(string.format("Loaded 1.4.2%s. The game's %d level 5.2 cutscenes, and any other H.264 video above level %s, play their 1080p copy (%d remembered file%s, %d hook%s).",
+    ENABLED and "" or " (switched OFF in its settings)", #BUILTIN_BAD, MAX_H264_LEVEL, n, n == 1 and "" or "s", hooked, hooked == 1 and "" or "s"))

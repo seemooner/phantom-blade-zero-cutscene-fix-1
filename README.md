@@ -1,29 +1,30 @@
-# 影之刃零播片黑屏修复（社区修订版）
+# 影之刃零播片黑屏修复
 
-> **兼容性提示（Steam build 26367565）**：本仓库旧版脚本搭配 UE4SS 1195 时，有一次动画开始后报错退出的反馈，原因尚未确定，建议暂缓在此版本使用。作者的 1.4.2 更新提到修复播放器销毁后引用导致的崩溃；该版本正在本地测试，尚未证实解决本次问题，也尚未同步到本仓库。旧版 26266538 的使用反馈见下文。
+本项目分发 Zypre 的 [Cutscene Blackscreen Fix](https://www.nexusmods.com/phantombladezero/mods/239) 1.4.2 版，帮助解决部分预录动画在 1440p 或更高分辨率下黑屏、画面停住但声音继续播放的问题。它尝试播放游戏自带的 1080p 视频副本，游戏画面仍使用原有分辨率；受影响的播片清晰度会降低。实际效果取决于问题原因。
 
-针对《影之刃零》PC Steam 版在 1440p 或更高分辨率下，部分预录动画黑屏、声音与字幕正常、动画结束后画面恢复的问题。本修订版基于 Zypre 的 [Cutscene Blackscreen Fix](https://www.nexusmods.com/phantombladezero/mods/239)。
+## 安装
 
-补丁尝试把符合条件的高编码级别 H.264 视频切换到游戏自带的低分辨率版本；游戏分辨率不变，被替换的视频画质会降低。问题原因可能不同，不能保证适用于所有黑屏。
+1. 退出游戏并备份存档。若已安装 UE4SS，请先备份现有模组和设置，避免覆盖其他模组。
+2. 从 [KintaroModding 发布页](https://github.com/KintaroModding/ue4ss/releases/tag/v3.0.1-1195-g1ceefac8)下载 `phantombladezero_ue4ss_v3.0.1-1195-g1ceefac8.zip`，按发布页说明将加载器放入 `PBZ/platform/steam/`。确认 `dwmapi.dll` 与 `ue4ss` 文件夹和 `PBZ.exe` 同级。
+3. 在本仓库选择 **Code → Download ZIP**，解压，将 `CutsceneFix` 文件夹复制到 `PBZ/platform/steam/ue4ss/Mods/`。确认其中包含 `enabled.txt`、`scripts/main.lua` 和 `scripts/pbz_menuconfig.lua`。
+4. 启动游戏，测试先前有问题的动画。如果仍异常，退出游戏后查看 `PBZ/platform/steam/ue4ss/UE4SS.log` 中的 `[CutsceneFix]` 信息。
 
-## 下载与安装
+Steam 用户可在游戏库中右键游戏，选择「管理 → 浏览本地文件」打开 `PBZ` 目录。本项目不包含 UE4SS 本身。加载器包可能附带其他默认启用的模组，请自行检查 `ue4ss/Mods/mods.txt` 和 `mods.json`。
 
-1. 退出游戏，并备份游戏存档。
-2. 从 [KintaroModding 发布页](https://github.com/KintaroModding/ue4ss/releases/tag/v3.0.1-1195-g1ceefac8) 下载 `phantombladezero_ue4ss_v3.0.1-1195-g1ceefac8.zip`。该游戏专用 UE4SS 1195 构建有社区报告支持 Steam build 26367565；其他 UE4SS 构建请核实兼容性。按该页面的安装说明，将压缩包内容解压到游戏的 `PBZ/platform/steam/` 文件夹；`dwmapi.dll` 和 `ue4ss` 文件夹应与 `PBZ.exe` 同级。已安装 UE4SS 的用户先备份现有模组和配置，并核实版本兼容性。
-3. 在本仓库选择 **Code → Download ZIP**，解压后将 `CutsceneFix` 文件夹复制到 `PBZ/platform/steam/ue4ss/Mods/`。确认最终存在 `ue4ss/Mods/CutsceneFix/scripts/main.lua` 和 `enabled.txt`。
-4. 启动游戏，在原有分辨率下重播异常动画。UE4SS 附带的其他模组是否启用取决于其配置；不需要时可按 UE4SS 说明禁用。
+## 验证与限制
 
-Steam 中可通过游戏属性 → 已安装文件 → 浏览定位 `PBZ` 文件夹。若动画仍黑屏，退出游戏后查看 `PBZ/platform/steam/ue4ss/UE4SS.log` 中的 `[CutsceneFix]` 行，确认补丁是否加载和是否发生重定向。
+在 Windows 11、RTX 4080 Laptop GPU、Steam build 26367565、UE4SS 1195 的一套设备上，日志确认 `3DCG_C07_MoBao.mp4` 已切换到 1080p 副本并开始播放；使用者确认先前导致退出的同一段动画正常播放且未退出。此前的旧版修订脚本在同一游戏版本播放时曾发生一次退出，原因未能最终确认。其他动画、显卡、系统及后续游戏更新尚未逐一验证；若出现黑屏或崩溃，请卸载补丁并按游戏原有设置排查。
+
+作者 1.4.2 的更新说明指出，它避免跨帧保留游戏视频播放器对象，以降低对象销毁后访问导致的崩溃风险；这与本次现象相符，但不能证明其为本次唯一原因。可能存在音画同步偏差，可参照作者说明调整 `Resync`。
 
 ## 卸载
 
-退出游戏后，从 `ue4ss/Mods/` 移走 `CutsceneFix` 文件夹即可禁用此补丁。如果不再需要 UE4SS，按其作者的安装页面说明卸载；若还有其他 UE4SS 模组，请保留加载器。不要用旧备份覆盖新的游戏进度。
+退出游戏后移走 `PBZ/platform/steam/ue4ss/Mods/CutsceneFix` 文件夹。如果还有其他模组使用 UE4SS，请保留加载器；否则按加载器发布页说明卸载。
 
-## 修改与验证
+## 版本、来源和致谢
 
-修订版收紧媒体源匹配、避免改写无关属性、在打开失败或超时时恢复修改、延迟记录成功缓存，并增加诊断日志。完整变更见 `changes.diff`。13 个 Lua 模拟场景通过；在一台 RTX 4080 Laptop GPU、Windows 11、Steam build 26266538 的设备上，用户反馈解决了对应播片黑屏。Steam build 26367565 搭配 UE4SS 1195 已验证游戏启动、脚本加载和媒体打开钩子注册，实际动画播放仍需验证；其他配置及所有过场动画尚未逐一验证，音画同步仍可能受影响。
+补丁由 **Zypre** 制作，原始页面及转载条款见 [Nexus Mods](https://www.nexusmods.com/phantombladezero/mods/239)。本次使用的 1.4.2 压缩包来自 [Playbuff 镜像](https://www.playbuff.net/mod/phantombladezero/cutscene-blackscreen-fix.html)，SHA-256 为 `10e135630e71721a9b3e744a1618dcc60c2d5759ff1b5b2aac23969d26bca8a8`；该值与镜像列示一致，但未能与作者官方包的哈希交叉核对。作者随包说明保存在 `UPSTREAM_README.txt`。
 
-## 致谢与许可
+UE4SS 由 [UE4SS-RE 与贡献者](https://github.com/UE4SS-RE/RE-UE4SS)开发，游戏适配包由 [KintaroModding](https://github.com/KintaroModding/ue4ss)发布。游戏及视频内容属于各自权利人，本仓库不包含游戏资源。
 
-原补丁作者 **Zypre**，见 [原始补丁页面与转载条款](https://www.nexusmods.com/phantombladezero/mods/239)。UE4SS 由 [UE4SS-RE 与贡献者](https://github.com/UE4SS-RE/RE-UE4SS)开发；游戏专用 1195 包由 [KintaroModding](https://github.com/KintaroModding/ue4ss/releases/tag/v3.0.1-1195-g1ceefac8)发布。本仓库不包含加载器，请从发布方页面获取。游戏与其素材属于各自权利人，本仓库不含游戏文件。
-
+`changes.diff` 是此前社区修订版的历史差异，**不描述目前的作者 1.4.2**；旧脚本另保存在 `archive/`。1.4.2 是作者原版，与此前的社区修订不是同一套实现，也未运行此前针对旧脚本编写的 13 项模拟测试。
